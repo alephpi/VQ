@@ -1,0 +1,31 @@
+[project]
+name = "bsq"
+version = "0.1.0"
+description = "VQ-VAE with FSQ quantizer on MNIST"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+	"torch",
+	"torchvision",
+	"tqdm",
+]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+bsq = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bsq"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]
