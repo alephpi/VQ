@@ -81,6 +81,7 @@ def main() -> None:
                 loss=f"{metrics['loss'].item():.4f}",
                 recon=f"{metrics['recon_loss'].item():.4f}",
                 commit=f"{metrics['commit_loss'].item():.4f}",
+                perplexity=f"{metrics['perplexity']:.3f}",
                 usage=f"{metrics['code_usage']:.3f}",
             )
 

@@ -6,6 +6,20 @@ from typing import Dict
 import torch
 from torchvision.utils import save_image
 
+import logging
+# Configure logger
+logger = logging.getLogger("BSQ")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s"))
+logger.addHandler(handler)
+
+
+def get_logger() -> logging.Logger:
+    return logger
+
+
 
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)

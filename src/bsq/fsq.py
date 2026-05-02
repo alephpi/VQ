@@ -1,108 +1,140 @@
-from __future__ import annotations
-
-from typing import List, Tuple
+# Finite Scalar Quantization: https://arxiv.org/abs/2309.15505
 
 import torch
 from torch import nn
 
+from .utils import get_logger
 
-class FSQQuantizer(nn.Module):
-    def __init__(self, levels: List[int]) -> None:
+logger = get_logger()
+
+
+def round_ste(z: torch.Tensor) -> torch.Tensor:
+    """Round with straight through gradients."""
+    zhat = z.round()
+    return z + (zhat - z).detach()
+
+
+def get_entropy(prob: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    return -torch.sum(prob * torch.log(prob + eps), dim=-1)
+
+
+class FSQ(nn.Module):
+    def __init__(self, levels: list[int]):
         super().__init__()
-        if not levels or any(l < 2 for l in levels):
-            raise ValueError("All levels must be >= 2.")
-        levels_tensor = torch.tensor(levels, dtype=torch.float32)
-        self.register_buffer("levels", levels_tensor)
-        self.register_buffer("steps", 2.0 / (levels_tensor - 1.0))
-        self.codebook_size = int(torch.prod(levels_tensor).item())
+        self.levels = levels
+        self.dim = len(levels)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = torch.tanh(x)
-        view_shape = [1, -1] + [1] * (x.ndim - 2)
-        levels = self.levels.view(*view_shape)
-        steps = self.steps.view(*view_shape)
+        _levels = torch.tensor(levels, dtype=torch.long)
+        self.register_buffer("_levels", _levels, persistent=False)
+        _basis = torch.cumprod(torch.tensor([1] + levels[:-1]), dim=0, dtype=torch.long)
+        self.register_buffer("_basis", _basis, persistent=False)
 
-        x_scaled = (x + 1.0) / steps
-        min_levels = torch.zeros_like(levels)
-        x_rounded = torch.round(x_scaled).clamp(min=min_levels, max=levels - 1.0)
-        x_quant = x_rounded * steps - 1.0
+    def bound(self, z: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+        """Bound `z`, an array of shape (..., d)."""
+        half_l = (self._levels - 1) * (1 - eps) / 2
+        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0)
+        shift = (offset / half_l).tan()
+        return (z + shift).tanh() * half_l - offset
 
-        x_st = x + (x_quant - x).detach()
-        indices = self._codes_from_rounded(x_rounded)
-        perplexity = self._perplexity(indices)
-        code_usage = self._code_usage(indices)
-        return x_st, indices, code_usage
+    def quantize(self, z: torch.Tensor) -> torch.Tensor:
+        """Quantizes z, returns quantized zhat, same shape as z."""
+        quantized = round_ste(self.bound(z))
+        half_width = self._levels // 2  # Renormalize to [-1, 1].
+        return quantized / half_width
 
-    def _codes_from_rounded(self, x_rounded: torch.Tensor) -> torch.Tensor:
-        if x_rounded.ndim == 4:
-            b, c, h, w = x_rounded.shape
-            flat = x_rounded.permute(0, 2, 3, 1).reshape(-1, c)
-            codes = self._flat_codes(flat)
-            return codes.view(b, h, w)
-        if x_rounded.ndim == 2:
-            return self._flat_codes(x_rounded)
-        raise ValueError("Expected a 2D or 4D tensor for quantization.")
+    def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
+        half_width = self._levels // 2
+        return (zhat_normalized * half_width) + half_width
 
-    def _flat_codes(self, flat: torch.Tensor) -> torch.Tensor:
-        levels = self.levels.to(dtype=torch.long)
-        multipliers = torch.cumprod(
-            torch.cat([torch.ones(1, device=levels.device, dtype=levels.dtype), levels[:-1]]),
-            dim=0,
+    def _scale_and_shift_inverse(self, zhat: torch.Tensor) -> torch.Tensor:
+        half_width = self._levels // 2
+        return (zhat - half_width) / half_width
+
+    def codes_to_indices(self, zhat: torch.Tensor) -> torch.Tensor:
+        """Converts a `code` to an index in the codebook."""
+        # (B, T, C) -> (B, T)
+        assert zhat.shape[-1] == len(self.levels)
+        zhat = self._scale_and_shift(zhat)
+        return (zhat * self._basis.to(torch.float64)).to(torch.long).sum(dim=-1)
+
+    def indices_to_codes(self, indices: torch.Tensor) -> torch.Tensor:
+        """Inverse of `codes_to_indices`."""
+        # (B, T) -> (B, T, C)
+        indices = indices.unsqueeze(-1)
+        codes_non_centered = (indices // self._basis) % self._levels
+        return self._scale_and_shift_inverse(codes_non_centered)
+
+    def encode(self, z: torch.Tensor) -> torch.Tensor:
+        z_q = self.quantize(z)
+        indices = self.codes_to_indices(z_q)  # (B, T)
+        return z_q, indices
+
+    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+        z_q = self.indices_to_codes(indices)  # (B, T, C)
+        return z_q
+
+    def forward(self, z: torch.Tensor):
+        z_q = self.quantize(z)
+        indices = self.codes_to_indices(z_q)  # (B, T)
+        return z_q, indices
+
+
+class FiniteScalarQuantizer(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, levels: list[int]) -> None:
+        super().__init__()
+        self.input_dim_ = input_dim
+        self.output_dim_ = output_dim
+
+        self.fsq = FSQ(levels)
+        logger.debug(
+            f"Finite Scalar Quantizer with levels: {levels}, input_dim: {input_dim}, output_dim: {output_dim}, codebook_size: {self.all_codebook_size}"
         )
-        flat_long = flat.to(dtype=torch.long)
-        return (flat_long * multipliers.view(1, -1)).sum(dim=-1)
 
-    def _perplexity(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.numel() == 0:
-            return torch.tensor(0.0, device=indices.device)
-        flat = indices.reshape(-1)
-        counts = torch.bincount(flat, minlength=self.codebook_size).float()
-        probs = counts / counts.sum()
-        entropy = -(probs * (probs + 1e-8).log()).sum()
-        return entropy.exp()
+        self.proj_in = nn.Linear(input_dim, len(levels)) if len(levels) != input_dim else nn.Identity()
+        self.proj_out = nn.Linear(len(levels), output_dim) if len(levels) != output_dim else nn.Identity()
 
-    def _code_usage(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.numel() == 0:
-            return torch.tensor(0.0, device=indices.device)
-        flat = indices.reshape(-1)
-        unique = torch.unique(flat)
-        return unique.numel() / float(self.codebook_size)
+    def build_codebook(self) -> None:
+        pass
 
-    def from_index(self, indices: torch.Tensor) -> torch.Tensor:
-        """
-        indices 的逆操作，从整数索引还原量化后的特征值。
+    @property
+    def output_dim(self) -> int:
+        return self.output_dim_
 
-        Args:
-            indices: (B, H, W) 或 (N,)  整数 codebook 索引
-        Returns:
-            (B, C, H, W) 或 (N, C)  量化值，值域 [-1, 1]
-        """
-        if indices.ndim == 3:
-            b, h, w = indices.shape
-            flat = indices.reshape(-1)                                   # (B*H*W,)
-            x_rounded = self._rounded_from_flat_codes(flat)              # (B*H*W, C)
-            x_rounded = x_rounded.view(b, h, w, -1).permute(0, 3, 1, 2) # (B, C, H, W)
-            return self._rounded_to_quant(x_rounded)
+    @property
+    def all_codebook_size(self) -> int:
+        size = 1
+        for level in self.fsq.levels:
+            size *= level
+        return size
 
-        if indices.ndim == 1:
-            x_rounded = self._rounded_from_flat_codes(indices)           # (N, C)
-            return self._rounded_to_quant(x_rounded)
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        latent = self.proj_in(z)  # Latent projected by proj_in
+        quantized_latent, indices = self.fsq(latent)  # Quantized latent before proj_out
+        z_q = self.proj_out(quantized_latent)
 
-        raise ValueError("Expected 1D or 3D indices tensor.")
+        # Compute perplexity from used indices distribution
+        flat_indices = indices.view(-1)
+        unique_indices, counts = torch.unique(flat_indices, return_counts=True)
+        used_indices_probs = counts.float() / flat_indices.numel()
+        entropy = get_entropy(used_indices_probs)
+        perplexity = torch.exp(entropy)
 
-    def _rounded_from_flat_codes(self, flat: torch.Tensor) -> torch.Tensor:
-        """_flat_codes 的逆：(N,) → (N, C)，混合进制拆解"""
-        levels = self.levels.to(dtype=torch.long)
-        multipliers = torch.cumprod(
-            torch.cat([torch.ones(1, device=levels.device, dtype=levels.dtype), levels[:-1]]),
-            dim=0,
-        )                                                  # [1, L0, L0*L1, ...]
-        # (N, 1) // (1, C) % (1, C)  →  每维整数值 [0, Li-1]
-        x_rounded = (flat.unsqueeze(-1) // multipliers.view(1, -1)) % levels.view(1, -1)
-        return x_rounded.float()
+        info_dict = {
+            "latent": latent,
+            "quantized_latent": quantized_latent,
+            "indices": indices,
+            "perplexity": perplexity,
+        }
+        return z_q, info_dict
 
-    def _rounded_to_quant(self, x_rounded: torch.Tensor) -> torch.Tensor:
-        """整数值 [0, Li-1] → 量化值 [-1, 1]，与 forward 中 x_quant 完全对称"""
-        view_shape = [1, -1] + [1] * (x_rounded.ndim - 2)
-        steps = self.steps.view(*view_shape)
-        return x_rounded * steps - 1.0
+    def encode(self, z: torch.Tensor, skip_proj: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        z = self.proj_in(z)
+        z_q, indices = self.fsq.encode(z)
+        if not skip_proj:
+            z_q = self.proj_out(z_q)
+        return z_q, indices
+
+    def decode(self, indices: torch.Tensor) -> torch.Tensor:
+        z_q = self.fsq.decode(indices)
+        z_q = self.proj_out(z_q)
+        return z_q
