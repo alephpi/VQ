@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.25)
     parser.add_argument("--levels", type=str, default="5,5,5")
     parser.add_argument("--quantizer", type=str, default="fsq", choices=["fsq", "bsq"])
-    parser.add_argument("--codebook-size", type=int, default=64)
+    parser.add_argument("--codebook-size", type=int, default=4096)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--device", type=str, default="auto")

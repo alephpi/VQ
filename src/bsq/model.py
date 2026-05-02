@@ -76,8 +76,10 @@ class VQVAE(nn.Module):
                 output_dim=embed_dim,
                 levels=levels,
             )
+            self.codebook_size = self.quantizer.all_codebook_size
         else:
-            self.quantizer = BinarySphericalQuantizer(codebook_size=codebook_size)
+            self.quantizer = BinarySphericalQuantizer(embed_dim)
+            self.codebook_size = codebook_size
         self.beta = beta
 
         # print parameters for debugging
@@ -91,16 +93,15 @@ class VQVAE(nn.Module):
         z_q_flat, info = self.quantizer(z_e_flat)
         indices = info["indices"]
         perplexity = info["perplexity"]
-        codebook_size = self.quantizer.all_codebook_size
         z_q = z_q_flat.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
         x_hat = self.decoder(z_q)
 
         recon_loss = F.mse_loss(x_hat, x)
-        commit_loss = F.mse_loss(z_e, z_q.detach())
+        commit_loss = info.get("commit_loss", F.mse_loss(z_e, z_q.detach()))
         loss = recon_loss + self.beta * commit_loss
 
         flat_indices = indices.view(-1)
-        code_usage = torch.unique(flat_indices).numel() / float(codebook_size)
+        code_usage = torch.unique(flat_indices).numel() / float(self.codebook_size)
 
         metrics = {
             "loss": loss,
@@ -108,7 +109,7 @@ class VQVAE(nn.Module):
             "commit_loss": commit_loss,
             "code_usage": torch.tensor(code_usage, device=x.device),
             "perplexity": perplexity,
-            "codebook_size": torch.tensor(codebook_size, device=x.device),
+            "codebook_size": torch.tensor(self.codebook_size, device=x.device),
             "indices": indices.reshape(batch_size, height, width),
         }
         return x_hat, metrics

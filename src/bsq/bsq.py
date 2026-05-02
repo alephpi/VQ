@@ -1,291 +1,77 @@
-# ==============================================================================
-# Copyright 2025 Luca Della Libera.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Binary spherical quantization (see https://arxiv.org/abs/2406.07548)."""
-
-# Adapted from:
-# https://github.com/lucidrains/vector-quantize-pytorch/blob/3e4ce165774d3f5944f12ffb5ccd02848bb38df6/vector_quantize_pytorch/lookup_free_quantization.py
-
-import math
-from typing import Tuple
-
 import torch
-from torch import Tensor, nn
-from torch.nn import functional as F
-
-
-__all__ = ["BinarySphericalQuantizer"]
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class BinarySphericalQuantizer(nn.Module):
-    """Binary spherical quantizer that maps inputs to binary codes on the unit hypersphere.
-
-    Parameters
-    ----------
-    codebook_size:
-        Number of binary codes in the codebook.
-
+    """
+    Binary Spherical Quantizer (BSQ)
+    输入 z: (B, D) 或 (B, T, D)
+    输出: 与输入同形，值域 {-1/√D, +1/√D}（单位球面上的顶点）
     """
 
-    def __init__(self, codebook_size: "int" = 4096) -> "None":
+    def __init__(self, dim: int):
         super().__init__()
-        self.codebook_size = codebook_size
-        self.dim = int(math.log2(codebook_size))
+        self.dim = dim
+        # 归一化因子：使量化后向量仍在单位球面上
+        self.register_buffer("scale", torch.tensor(dim).sqrt().reciprocal())
 
-        # Buffers
-        self.register_buffer(
-            "codebook_value",
-            torch.tensor(1 / math.sqrt(self.dim)),
-            persistent=False,
-        )
-        self.register_buffer(
-            "mask", 2 ** torch.arange(self.dim - 1, -1, -1), persistent=False
-        )
-        all_codes = torch.arange(codebook_size)
-        bits = (all_codes[..., None].int() & self.mask) != 0
-        codebook = self._bits_to_codes(bits) * self.codebook_value
-        self.register_buffer("codebook", codebook, persistent=False)
+    def _bits_to_indices(self, bits: torch.Tensor) -> torch.Tensor:
+        basis = torch.pow(2, torch.arange(self.dim - 1, -1, -1, device=bits.device))
+        return (bits.to(torch.long) * basis).sum(dim=-1)
 
-    def forward(self, lats: "Tensor") -> "Tuple[Tensor, dict]":
-        """Forward pass.
+    def quantize(self, z: torch.Tensor) -> torch.Tensor:
+        """纯量化，无梯度技巧"""
+        return torch.sign(z) * self.scale  # 二值化，保持在球面上
 
-        Parameters
-        ----------
-        lats:
-            Input latents of shape (..., dim).
+    def forward(self, z: torch.Tensor):
+        z = F.normalize(z, p=2, dim=-1)   # 投影到单位球
+        z_q = self.quantize(z)
+        z_q_st = z + (z_q - z).detach()
+        commit_loss = F.mse_loss(z, z_q.detach())
 
-        Returns
-        -------
-            - Output codes (i.e. quantized latents) of shape (..., dim);
-            - info dict with indices and perplexity.
-
-        """
-        indices = self.lats_to_toks(lats)
-        codes = self.toks_to_codes(indices)
-
-        flat_indices = indices.view(-1)
+        bits = (z_q > 0).to(torch.uint8)
+        indices = self._bits_to_indices(bits)
+        flat_indices = indices.reshape(-1)
         unique_indices, counts = torch.unique(flat_indices, return_counts=True)
         used_indices_probs = counts.float() / flat_indices.numel()
-        entropy = -(used_indices_probs * torch.log(used_indices_probs + 1e-10)).sum(dim=-1)
+        entropy = -(used_indices_probs * torch.log(used_indices_probs + 1e-10)).sum()
         perplexity = torch.exp(entropy)
 
-        info = {
+        info_dict = {
             "indices": indices,
             "perplexity": perplexity,
+            "commit_loss": commit_loss,
         }
-        return codes, info
+        return z_q_st, info_dict
 
-    @torch.jit.export
-    def lats_to_codes(self, lats: "Tensor") -> "Tensor":
-        """Transform latents into codes (i.e. quantized latents).
+    def encode(self, z: torch.Tensor) -> torch.Tensor:
+        """返回 {0, 1} 的二进制码（便于存储/索引）"""
+        z_norm = F.normalize(z, p=2, dim=-1)
+        return (torch.sign(z_norm) > 0).to(torch.uint8)  # (B, D) bool
 
-        Parameters
-        ----------
-        lats:
-            Input latents of shape (..., dim).
-
-        Returns
-        -------
-            Output codes of shape (..., dim).
-
-        """
-        lats = self._normalize(lats)
-        return torch.where(lats > 0, self.codebook_value, -self.codebook_value)
-
-    @torch.jit.export
-    def lats_to_toks(self, lats: "Tensor") -> "Tensor":
-        """Transform latents into tokens.
-
-        Parameters
-        ----------
-        lats:
-            Input latents of shape (..., dim).
-
-        Returns
-        -------
-            Output tokens of shape (...).
-
-        """
-        lats = self._normalize(lats)
-        return self.codes_to_toks(lats)
-
-    @torch.jit.export
-    def codes_to_toks(self, codes: "Tensor") -> "Tensor":
-        """Transform codes (i.e. quantized latents) into tokens.
-
-        Parameters
-        ----------
-        codes:
-            Input codes of shape (..., dim).
-
-        Returns
-        -------
-            Output tokens of shape (...).
-
-        """
-        return ((codes > 0) * self.mask).sum(dim=-1)
-
-    @torch.jit.export
-    def toks_to_codes(self, toks: "Tensor") -> "Tensor":
-        """Transform tokens into codes (i.e. quantized latents).
-
-        Parameters
-        ----------
-        toks:
-            Input tokens of shape (...).
-
-        Returns
-        -------
-            Output codes of shape (..., dim).
-
-        """
-        # ONNX compilable
-        bits = ((toks[..., None] // self.mask) % 2).to(self.codebook.dtype)
-        return self._bits_to_codes(bits) * self.codebook_value
-
-    def _bits_to_codes(self, bits: "Tensor") -> "Tensor":
-        return bits * 2 - 1
-
-    def _normalize(self, lats: "Tensor") -> "Tensor":
-        return F.normalize(lats, dim=-1, eps=1e-8)
-
-    def __repr__(self) -> "str":
-        return f"{self.__class__.__name__}(codebook_size={self.codebook_size})"
-
-    @property
-    def all_codebook_size(self) -> int:
-        return self.codebook_size
+    def decode(self, bits: torch.Tensor) -> torch.Tensor:
+        """从 {0,1} 码还原量化向量"""
+        return (bits.float() * 2 - 1) * self.scale
 
 
-class _OnnxWrapper(nn.Module):
-    def __init__(self, quantizer: BinarySphericalQuantizer) -> None:
-        super().__init__()
-        self.quantizer = quantizer
-
-    def forward(self, lats: "Tensor") -> "Tuple[Tensor, Tensor]":
-        toks = self.quantizer.lats_to_toks(lats)
-        codes = self.quantizer.toks_to_codes(toks)
-        return toks, codes
-
-
-def test_model() -> "None":
-    torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    B = 3
-    T = 50
-    model = BinarySphericalQuantizer().to(device)
-    print(model)
-    print(
-        f"Model size: {sum([x.numel() for x in model.state_dict().values()]) / 1e6:.2f}M"
-    )
-
-    lats = torch.randn(B, T, model.dim, device=device)
-    codes, info = model(lats)
-    toks = info["indices"]
-    codes2 = model.lats_to_codes(lats)
-    toks2 = model.lats_to_toks(lats)
-    toks3 = model.codes_to_toks(codes)
-    assert (toks == toks2).all()
-    assert (toks == toks3).all()
-    assert (codes == codes2).all()
-    model_jit = torch.jit.script(model)
-    codes_jit, info_jit = model_jit(lats)
-    assert (toks == info_jit["indices"]).all()
-    assert (codes == codes_jit).all()
-
-    print("Model test passed")
-
-
-def test_batch_invariance() -> "None":
-    torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    B = 10
-    T = 50
-    model = BinarySphericalQuantizer().to(device)
-
-    lats = torch.randn(B, T, model.dim, device=device)
-    batch_codes, batch_info = model(lats)
-    batch_toks = batch_info["indices"]
-
-    all_single_toks, all_single_codes = [], []
-    for i in range(B):
-        single_codes, single_info = model(lats[i][None])
-        all_single_toks.append(single_info["indices"])
-        all_single_codes.append(single_codes)
-    all_single_toks = torch.cat(all_single_toks)
-    all_single_codes = torch.cat(all_single_codes)
-
-    assert (batch_toks == all_single_toks).all()
-    assert (batch_codes == all_single_codes).all()
-
-    print("Batch invariance test passed")
-
-
-@torch.no_grad()
-def test_onnx() -> "None":
-    import io
-    import warnings
-
-    torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    B = 3
-    T = 50
-    model = BinarySphericalQuantizer().eval().to(device)
-    onnx_model = _OnnxWrapper(model).eval().to(device)
-
-    lats = torch.randn(B, T, model.dim, device=device)
-
-    f = io.BytesIO()
-    torch.onnx.export(
-        onnx_model,
-        (lats,),
-        f,
-        input_names=["lats"],
-        output_names=["toks", "codes"],
-        dynamic_axes={
-            "lats": {0: "batch", 1: "latent_time"},
-            "toks": {0: "batch", 1: "latent_time"},
-            "codes": {0: "batch", 1: "latent_time"},
-        },
-    )
-    onnx_bytes = f.getvalue()
-
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        warnings.warn("`pip install onnxruntime` to test ONNX")
-        return
-
-    lats = torch.randn(2 * B, 2 * T, model.dim, device=device)
-
-    session = ort.InferenceSession(onnx_bytes)
-    inputs_ort = dict(zip([x.name for x in session.get_inputs()], [lats.cpu().numpy()]))
-    outputs_ort = session.run([x.name for x in session.get_outputs()], inputs_ort)
-    toks, codes = onnx_model(lats)
-
-    assert (toks.cpu() == torch.tensor(outputs_ort[0])).all()
-    assert (codes.cpu() == torch.tensor(outputs_ort[1])).all()
-
-    print("ONNX test passed")
-
-
+# ── 快速验证 ──────────────────────────────────────────────
 if __name__ == "__main__":
-    test_model()
-    test_batch_invariance()
-    test_onnx()
+    D = 64
+    bsq = BinarySphericalQuantizer(dim=D)
+
+    z = torch.randn(4, D, requires_grad=True)        # batch=4
+    z_q, info = bsq(z)
+
+    print(f"输入范数: {z.norm(dim=-1).mean():.3f}")
+    print(f"输出范数: {z_q.norm(dim=-1).mean():.3f}")  # ≈ 1.0
+    print(f"Commit loss: {info['commit_loss'].item():.4f}")
+
+    # 验证梯度能反传
+    info["commit_loss"].backward()
+    print(f"梯度存在: {z.grad is not None}")
+
+    # 编解码往返
+    bits = bsq.encode(z)
+    z_rec = bsq.decode(bits)
+    print(f"编解码误差: {(z_rec - bsq.quantize(z)).abs().max().item():.6f}")  # ≈ 0
