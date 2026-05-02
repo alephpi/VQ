@@ -20,7 +20,7 @@ class Encoder(nn.Module):
             nn.Conv2d(64, 128, 3, 2, 1), # 7x7 -> 4x4
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 256, 2, 2, 1), # 4x4 -> 2x2
-            # nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True),
             nn.Conv2d(256, embed_dim, 1),
         )
 
@@ -33,7 +33,7 @@ class Decoder(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(embed_dim, 256, 1),
-            # nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True),
             nn.ConvTranspose2d(256, 128, 2, 2, 1),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, 3, 2, 1),
