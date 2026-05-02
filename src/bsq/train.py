@@ -34,13 +34,13 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> torc
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train VQ-VAE with FSQ on MNIST")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta", type=float, default=0.25)
-    parser.add_argument("--levels", type=str, default="5,5,5,5")
+    parser.add_argument("--levels", type=str, default="5,5,5")
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="outputs")
@@ -56,6 +56,12 @@ def main() -> None:
 
     model = VQVAE(levels=levels, beta=args.beta).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # total_steps = args.epochs * len(train_loader)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=total_steps,
+    #     eta_min=1e-5,
+    # )
 
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(args.output_dir) / run_name
@@ -70,6 +76,7 @@ def main() -> None:
             loss = metrics["loss"]
             loss.backward()
             optimizer.step()
+            # scheduler.step()
             progress.set_postfix(
                 loss=f"{metrics['loss'].item():.4f}",
                 recon=f"{metrics['recon_loss'].item():.4f}",
@@ -78,7 +85,6 @@ def main() -> None:
             )
 
         test_loss = evaluate(model, test_loader, device)
-
         sample_inputs, _ = next(iter(test_loader))
         sample_inputs = sample_inputs[:8].to(device)
         with torch.no_grad():
@@ -89,9 +95,10 @@ def main() -> None:
             sample_inputs.cpu(),
             sample_recons.cpu(),
         )
-        save_checkpoint(run_dir / f"checkpoint_epoch_{epoch:03d}.pt", model, optimizer, epoch)
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch}: test_loss={test_loss.item():.4f}, lr={current_lr:.6f}")
 
-        print(f"Epoch {epoch}: test_loss={test_loss.item():.4f}")
+    save_checkpoint(run_dir / f"checkpoint_epoch_{args.epochs:03d}.pt", model, optimizer, args.epochs)
 
 
 if __name__ == "__main__":

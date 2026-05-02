@@ -19,9 +19,9 @@ class Encoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1), # 7x7 -> 4x4
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 4, 0, 1), # 4x4 -> 1x1
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, embed_dim, 1),
+            nn.Conv2d(128, 256, 2, 2, 1), # 4x4 -> 2x2
+            # nn.ReLU(inplace=True),
+            nn.Conv2d(256, embed_dim, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -32,9 +32,9 @@ class Decoder(nn.Module):
     def __init__(self, embed_dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(embed_dim, 128, 1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 128, 4, 0, 1),
+            nn.Conv2d(embed_dim, 256, 1),
+            # nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, 2, 2, 1),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, 3, 2, 1),
             nn.ReLU(inplace=True),
@@ -56,6 +56,10 @@ class VQVAE(nn.Module):
         self.decoder = Decoder(embed_dim)
         self.quantizer = FSQQuantizer(levels)
         self.beta = beta
+
+        # print parameters for debugging
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Model initialized with {total_params} parameters.")
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         z_e = self.encoder(x)
