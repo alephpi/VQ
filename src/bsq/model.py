@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Tuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .bsq import BinarySphericalQuantizer
 from .fsq import FiniteScalarQuantizer
 
 
@@ -49,16 +51,33 @@ class Decoder(nn.Module):
 
 
 class VQVAE(nn.Module):
-    def __init__(self, levels: List[int], beta: float) -> None:
+    def __init__(
+        self,
+        levels: List[int],
+        beta: float,
+        quantizer: str = "fsq",
+        codebook_size: int = 4096,
+    ) -> None:
         super().__init__()
-        embed_dim = len(levels)
+        if quantizer not in {"fsq", "bsq"}:
+            raise ValueError("quantizer must be 'fsq' or 'bsq'")
+
+        if quantizer == "fsq":
+            embed_dim = len(levels)
+        else:
+            if codebook_size < 2 or (codebook_size & (codebook_size - 1)) != 0:
+                raise ValueError("codebook_size must be a power of 2 for BSQ")
+            embed_dim = int(math.log2(codebook_size))
         self.encoder = Encoder(embed_dim)
         self.decoder = Decoder(embed_dim)
-        self.quantizer = FiniteScalarQuantizer(
-            input_dim=embed_dim,
-            output_dim=embed_dim,
-            levels=levels,
-        )
+        if quantizer == "fsq":
+            self.quantizer = FiniteScalarQuantizer(
+                input_dim=embed_dim,
+                output_dim=embed_dim,
+                levels=levels,
+            )
+        else:
+            self.quantizer = BinarySphericalQuantizer(codebook_size=codebook_size)
         self.beta = beta
 
         # print parameters for debugging
@@ -70,6 +89,9 @@ class VQVAE(nn.Module):
         batch_size, channels, height, width = z_e.shape
         z_e_flat = z_e.permute(0, 2, 3, 1).reshape(batch_size, height * width, channels)
         z_q_flat, info = self.quantizer(z_e_flat)
+        indices = info["indices"]
+        perplexity = info["perplexity"]
+        codebook_size = self.quantizer.all_codebook_size
         z_q = z_q_flat.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
         x_hat = self.decoder(z_q)
 
@@ -77,16 +99,16 @@ class VQVAE(nn.Module):
         commit_loss = F.mse_loss(z_e, z_q.detach())
         loss = recon_loss + self.beta * commit_loss
 
-        flat_indices = info["indices"].view(-1)
-        code_usage = torch.unique(flat_indices).numel() / float(self.quantizer.all_codebook_size)
+        flat_indices = indices.view(-1)
+        code_usage = torch.unique(flat_indices).numel() / float(codebook_size)
 
         metrics = {
             "loss": loss,
             "recon_loss": recon_loss,
             "commit_loss": commit_loss,
             "code_usage": torch.tensor(code_usage, device=x.device),
-            "perplexity": info["perplexity"],
-            "codebook_size": torch.tensor(self.quantizer.all_codebook_size, device=x.device),
-            "indices": info["indices"].reshape(batch_size, height, width),
+            "perplexity": perplexity,
+            "codebook_size": torch.tensor(codebook_size, device=x.device),
+            "indices": indices.reshape(batch_size, height, width),
         }
         return x_hat, metrics

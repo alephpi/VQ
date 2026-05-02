@@ -33,12 +33,14 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> torc
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train VQ-VAE with FSQ on MNIST")
+    parser = argparse.ArgumentParser(description="Train VQ-VAE with FSQ or BSQ on MNIST")
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta", type=float, default=0.25)
     parser.add_argument("--levels", type=str, default="5,5,5")
+    parser.add_argument("--quantizer", type=str, default="fsq", choices=["fsq", "bsq"])
+    parser.add_argument("--codebook-size", type=int, default=64)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--device", type=str, default="auto")
@@ -54,7 +56,12 @@ def main() -> None:
         args.batch_size, args.num_workers, args.data_dir
     )
 
-    model = VQVAE(levels=levels, beta=args.beta).to(device)
+    model = VQVAE(
+        levels=levels,
+        beta=args.beta,
+        quantizer=args.quantizer,
+        codebook_size=args.codebook_size,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     # total_steps = args.epochs * len(train_loader)
     # scheduler = optim.lr_scheduler.CosineAnnealingLR(
