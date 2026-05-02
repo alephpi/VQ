@@ -1,6 +1,6 @@
-## VQ-VAE with FSQ on MNIST
+## VQ-VAE with FSQ/BSQ on MNIST
 
-This project trains a VQ-VAE model on MNIST using a Finite Scalar Quantization (FSQ) quantizer and a Binary Spherical Quantization (BSQ).
+A simple tutorial of VQ-VAE model on MNIST with Finite Scalar Quantization (FSQ) / Binary Spherical Quantization (BSQ).
 
 ### Setup
 
